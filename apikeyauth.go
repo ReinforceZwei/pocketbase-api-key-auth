@@ -7,6 +7,7 @@
 package apikeyauth
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/pocketbase/pocketbase/apis"
@@ -108,8 +109,8 @@ func Register(app core.App, opts ...Option) {
 		opt(&cfg)
 	}
 
-	if err := validateKeyPrefix(cfg.KeyPrefix); err != nil {
-		log.Fatalf("apikeyauth: invalid key prefix: %v", err)
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("apikeyauth: invalid config: %v", err)
 	}
 
 	// OnBootstrap: ensure the apiKeys collection exists / is migrated
@@ -125,10 +126,29 @@ func Register(app core.App, opts ...Option) {
 		// Global middleware — runs on every request, checks for API key
 		se.Router.BindFunc(apiKeyAuthMiddleware(app, cfg))
 
-		// Key creation endpoint (other operations via PocketBase Record API)
+		// Key creation endpoint
 		se.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
+			Bind(apis.RequireAuth())
+
+		// Key update endpoint (only name, disabled, expires_at are allowed)
+		se.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+			Bind(apis.RequireAuth())
+
+		// Key deletion endpoint
+		se.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
 			Bind(apis.RequireAuth())
 
 		return se.Next()
 	})
+}
+
+// validateConfig checks that the plugin configuration is safe and valid.
+func validateConfig(cfg Config) error {
+	if err := validateKeyPrefix(cfg.KeyPrefix); err != nil {
+		return fmt.Errorf("key prefix: %w", err)
+	}
+	if cfg.KeyLength < MinKeyLength {
+		return fmt.Errorf("key length must be at least %d, got %d", MinKeyLength, cfg.KeyLength)
+	}
+	return nil
 }

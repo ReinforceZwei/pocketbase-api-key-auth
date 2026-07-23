@@ -103,3 +103,115 @@ func createAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) er
 		return e.JSON(http.StatusCreated, result)
 	}
 }
+
+// updateAPIKeyHandler handles PATCH /api/api-key/:id (or the configured ApiPath/:id).
+//
+// Only the following fields may be mutated:
+//   - name (user-defined label)
+//   - disabled (soft revoke / re-enable)
+//   - expires_at (optional expiry)
+//
+// user, key_hash, and key_prefix are immutable. Any attempt to set them is rejected.
+// The authenticated user must own the record.
+func updateAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		recordId := e.Request.PathValue("id")
+		if recordId == "" {
+			return e.BadRequestError("missing key id", nil)
+		}
+
+		record, err := app.FindRecordById(cfg.CollectionName, recordId)
+		if err != nil {
+			return e.NotFoundError("api key not found", err)
+		}
+
+		// Verify ownership — the authenticated user must own this key
+		if record.GetString("user") != e.Auth.Id {
+			return e.ForbiddenError("you can only update your own API keys", nil)
+		}
+
+		// Parse request body into a raw map first so we can reject
+		// forbidden fields before applying any mutations.
+		var rawBody map[string]interface{}
+		if err := e.BindBody(&rawBody); err != nil {
+			return e.BadRequestError("invalid request body", err)
+		}
+
+		// Reject any attempt to mutate immutable fields
+		for key := range rawBody {
+			switch key {
+			case "user", "key_hash", "key_prefix", "key", "id", "created", "updated":
+				return e.BadRequestError(
+					fmt.Sprintf("field %q is immutable and cannot be changed", key), nil,
+				)
+			}
+		}
+
+		// Apply allowed fields
+		if rawName, ok := rawBody["name"]; ok {
+			name, _ := rawName.(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return e.BadRequestError("name cannot be empty", nil)
+			}
+			record.Set("name", name)
+		}
+
+		if rawDisabled, ok := rawBody["disabled"]; ok {
+			disabled, ok := rawDisabled.(bool)
+			if !ok {
+				return e.BadRequestError("disabled must be a boolean", nil)
+			}
+			record.Set("disabled", disabled)
+		}
+
+		if rawExpiresAt, ok := rawBody["expires_at"]; ok {
+			expiresStr, _ := rawExpiresAt.(string)
+			if expiresStr == "" {
+				record.Set("expires_at", nil)
+			} else {
+				dt, err := types.ParseDateTime(expiresStr)
+				if err != nil {
+					return e.BadRequestError("invalid expires_at format, use ISO 8601", err)
+				}
+				record.Set("expires_at", dt)
+			}
+		}
+
+		if err := app.Save(record); err != nil {
+			return e.InternalServerError("failed to update API key", err)
+		}
+
+		return e.JSON(http.StatusOK, record.PublicExport())
+	}
+}
+
+// deleteAPIKeyHandler handles DELETE /api/api-key/:id (or the configured ApiPath/:id).
+//
+// Only the key owner can delete their own keys.
+func deleteAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		recordId := e.Request.PathValue("id")
+		if recordId == "" {
+			return e.BadRequestError("missing key id", nil)
+		}
+
+		record, err := app.FindRecordById(cfg.CollectionName, recordId)
+		if err != nil {
+			return e.NotFoundError("api key not found", err)
+		}
+
+		// Verify ownership
+		if record.GetString("user") != e.Auth.Id {
+			return e.ForbiddenError("you can only delete your own API keys", nil)
+		}
+
+		if err := app.Delete(record); err != nil {
+			return e.InternalServerError("failed to delete API key", err)
+		}
+
+		return e.JSON(http.StatusOK, map[string]string{
+			"message": "API key deleted",
+		})
+	}
+}

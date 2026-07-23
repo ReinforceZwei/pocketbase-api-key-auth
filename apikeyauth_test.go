@@ -166,11 +166,11 @@ func TestDesiredCollection(t *testing.T) {
 	if c.ViewRule == nil || *c.ViewRule != "user = @request.auth.id" {
 		t.Error("ViewRule not set correctly")
 	}
-	if c.CreateRule == nil || *c.CreateRule != "user = @request.auth.id" {
-		t.Error("CreateRule not set correctly")
+	if c.CreateRule != nil {
+		t.Error("CreateRule should be nil (generic create disabled)")
 	}
-	if c.UpdateRule == nil || *c.UpdateRule != "user = @request.auth.id" {
-		t.Error("UpdateRule not set correctly")
+	if c.UpdateRule != nil {
+		t.Error("UpdateRule should be nil (generic update disabled)")
 	}
 	if c.DeleteRule == nil || *c.DeleteRule != "user = @request.auth.id" {
 		t.Error("DeleteRule not set correctly")
@@ -819,5 +819,413 @@ func TestWithKeyPrefix_Invalid_Extended(t *testing.T) {
 		if err := validateKeyPrefix(p); err == nil {
 			t.Errorf("expected error for invalid prefix %q", p)
 		}
+	}
+}
+
+// =============================================================================
+// Config Validation Tests
+// =============================================================================
+
+func TestValidateConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		keyLength  int
+		keyPrefix  string
+		wantErr    bool
+		errContain string
+	}{
+		{name: "valid", keyLength: 43, keyPrefix: "pbk_", wantErr: false},
+		{name: "exactly minimum", keyLength: 32, keyPrefix: "app_", wantErr: false},
+		{name: "zero length", keyLength: 0, keyPrefix: "pbk_", wantErr: true, errContain: "key length"},
+		{name: "negative length", keyLength: -5, keyPrefix: "pbk_", wantErr: true, errContain: "key length"},
+		{name: "one below minimum", keyLength: 31, keyPrefix: "pbk_", wantErr: true, errContain: "key length"},
+		{name: "invalid prefix", keyLength: 43, keyPrefix: "no", wantErr: true, errContain: "key prefix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				KeyPrefix: tt.keyPrefix,
+				KeyLength: tt.keyLength,
+			}
+			err := validateConfig(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateConfig() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if err != nil && tt.errContain != "" {
+				if !strings.Contains(err.Error(), tt.errContain) {
+					t.Errorf("expected error to contain %q, got %q", tt.errContain, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Generic Record API Blocked Tests
+// =============================================================================
+
+func TestGenericCreateBlocked(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:   "generic create on apiKeys collection is blocked",
+			Method: http.MethodPost,
+			URL:    "/api/collections/apiKeys/records",
+			Body:   strings.NewReader(`{"name":"hacked","key_hash":"abc","key_prefix":"pbk_","user":"` + testUserId + `"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+				"Content-Type":  "application/json",
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				cfg := DefaultConfig()
+				bootstrapPlugin(app, tb, cfg)
+			},
+			ExpectedStatus:  403,
+			ExpectedContent: []string{`Only superusers`},
+		},
+	}
+
+	for _, s := range scenarios {
+		s.Test(t)
+	}
+}
+
+func TestGenericUpdateBlocked(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "generic update on apiKeys collection is blocked",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"user":"someoneelse"}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			// Create a key via the custom handler path (direct DB insert)
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			// Mutate URL after record is created
+			scenario.URL = "/api/collections/apiKeys/records/" + recordId
+		},
+		ExpectedStatus:  403,
+		ExpectedContent: []string{`Only superusers`},
+	}
+
+	scenario.Test(t)
+}
+
+// =============================================================================
+// Update API Key Handler Tests (PATCH /api/api-key/:id)
+// =============================================================================
+
+func TestUpdateAPIKeyHandler_Rename(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "rename api key via PATCH",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"name":"Renamed Key"}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  200,
+		ExpectedContent: []string{`"name":"Renamed Key"`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_DisableAndReenable(t *testing.T) {
+	t.Parallel()
+
+	// First disable
+	var scenario1 tests.ApiScenario
+	scenario1 = tests.ApiScenario{
+		Name:   "disable api key via PATCH",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"disabled":true}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario1.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  200,
+		ExpectedContent: []string{`"disabled":true`},
+	}
+
+	scenario1.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_SetExpiry(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "set expiry on api key via PATCH",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"expires_at":"2099-12-31 23:59:59.000Z"}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  200,
+		ExpectedContent: []string{`"expires_at":"2099-12-31`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_CannotChangeUser(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "cannot change user field via PATCH",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"user":"hacked_id"}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  400,
+		ExpectedContent: []string{`immutable`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_CannotChangeHash(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "cannot change key_hash field via PATCH",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"key_hash":"evil_hash"}`),
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+			"Content-Type":  "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  400,
+		ExpectedContent: []string{`immutable`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_Unauthenticated(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "update api key without auth ??unauthorized",
+		Method: http.MethodPatch,
+		URL:    "", // set in BeforeTestFunc
+		Body:   strings.NewReader(`{"name":"No Auth"}`),
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  401,
+		ExpectedContent: []string{`"status":401`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestUpdateAPIKeyHandler_NotFound(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:   "update nonexistent key ??not found",
+			Method: http.MethodPatch,
+			URL:    "/api/api-key/nonexistent123",
+			Body:   strings.NewReader(`{"name":"Ghost Key"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+				"Content-Type":  "application/json",
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				cfg := DefaultConfig()
+				bootstrapPlugin(app, tb, cfg)
+				e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
+					Bind(apis.RequireAuth())
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+	}
+
+	for _, s := range scenarios {
+		s.Test(t)
+	}
+}
+
+// =============================================================================
+// Delete API Key Handler Tests (DELETE /api/api-key/:id)
+// =============================================================================
+
+func TestDeleteAPIKeyHandler_Success(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "delete own api key",
+		Method: http.MethodDelete,
+		URL:    "", // set in BeforeTestFunc
+		Headers: map[string]string{
+			"Authorization": testUserToken,
+		},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  200,
+		ExpectedContent: []string{`"message":"API key deleted"`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestDeleteAPIKeyHandler_Unauthenticated(t *testing.T) {
+	t.Parallel()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:    "delete api key without auth ??unauthorized",
+		Method:  http.MethodDelete,
+		URL:     "", // set in BeforeTestFunc
+		Headers: map[string]string{},
+		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			cfg := DefaultConfig()
+			bootstrapPlugin(app, tb, cfg)
+
+			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+
+			e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
+				Bind(apis.RequireAuth())
+
+			scenario.URL = cfg.ApiPath + "/" + recordId
+		},
+		ExpectedStatus:  401,
+		ExpectedContent: []string{`"status":401`},
+	}
+
+	scenario.Test(t)
+}
+
+func TestDeleteAPIKeyHandler_NotFound(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:   "delete nonexistent key ??not found",
+			Method: http.MethodDelete,
+			URL:    "/api/api-key/nonexistent123",
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				cfg := DefaultConfig()
+				bootstrapPlugin(app, tb, cfg)
+				e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
+					Bind(apis.RequireAuth())
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+	}
+
+	for _, s := range scenarios {
+		s.Test(t)
 	}
 }

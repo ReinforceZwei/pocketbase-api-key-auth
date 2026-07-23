@@ -7,6 +7,11 @@ import (
 	"github.com/pocketbase/pocketbase/tools/security"
 )
 
+// MinKeyLength is the minimum number of random characters required after the prefix.
+// Shorter keys are trivially brute-forced or predictable (e.g. a length of 0
+// produces a key that is literally just the prefix, which is public knowledge).
+const MinKeyLength = 32
+
 // generateAPIKey creates a new API key with the given prefix and random character length.
 // Returns the full raw key (prefix + RandomString) and its SHA-256 hash.
 // Uses PocketBase's security.RandomString (crypto/rand backed) and security.SHA256.

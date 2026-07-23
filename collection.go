@@ -23,6 +23,7 @@ func desiredCollection(cfg Config) *core.Collection {
 		Name:     "key_hash",
 		Required: true,
 		Max:      64, // SHA-256 hex = 64 chars
+		Hidden:   true,
 	})
 
 	// key_prefix: the prefix portion (e.g. "pbk_") — stored for auditing
@@ -58,11 +59,15 @@ func desiredCollection(cfg Config) *core.Collection {
 		"CREATE UNIQUE INDEX idx_api_key_user_name ON {{NAME}} (user, name)",
 	)
 
-	// API Rules — only the owner can access their own keys
+	// API Rules — only the owner can access their own keys.
+	// Create and Update are explicitly disabled: the custom handlers
+	// (POST/PATCH/DELETE /api/api-key) are the only supported paths
+	// for creating and mutating key records. This prevents impersonation
+	// via generic record endpoints (see security-review.md).
 	c.ListRule = types.Pointer("user = @request.auth.id")
 	c.ViewRule = types.Pointer("user = @request.auth.id")
-	c.CreateRule = types.Pointer("user = @request.auth.id")
-	c.UpdateRule = types.Pointer("user = @request.auth.id")
+	c.CreateRule = nil
+	c.UpdateRule = nil
 	c.DeleteRule = types.Pointer("user = @request.auth.id")
 
 	return c
