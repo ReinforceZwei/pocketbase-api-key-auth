@@ -51,7 +51,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		CollectionName: "api_keys",
+		CollectionName: "apiKeys",
 		CollectionID:   "pbc_apikeys_plugin",
 		HeaderName:     "X-API-Key",
 		ApiPath:        "/api/api-key",
