@@ -41,7 +41,7 @@ func main() {
 }
 ```
 
-That's it. On first boot a new `api_keys` collection is auto-created.  
+That's it. On first boot a new `apiKeys` collection is auto-created.  
 After that, call `POST /api/api-key` to create your first key.
 
 ---
@@ -56,7 +56,7 @@ apikeyauth.Register(app,
     apikeyauth.WithApiPath("/api/custom-keys"),  // creation endpoint (default: "/api/api-key")
     apikeyauth.WithKeyPrefix("myapp_"),          // prefix for all generated keys (default: "pbk_")
     apikeyauth.WithKeyLength(50),                // random chars after prefix (default: 43)
-    apikeyauth.WithCollectionName("app_keys"),   // collection name (default: "api_keys")
+    apikeyauth.WithCollectionName("app_keys"),   // collection name (default: "apiKeys")
     apikeyauth.WithCollectionID("pbc_mykeys"),   // stable collection ID (default: "pbc_apikeys_plugin")
     apikeyauth.WithMaxKeysPerUser(5),            // limit active keys per user, 0=unlimited (default: 0)
 )
@@ -68,7 +68,7 @@ apikeyauth.Register(app,
 | `WithApiPath` | `"/api/api-key"` | Route for the key creation endpoint |
 | `WithKeyPrefix` | `"pbk_"` | Prefix for all generated keys |
 | `WithKeyLength` | `43` | Random `[A-Za-z0-9]` characters after prefix |
-| `WithCollectionName` | `"api_keys"` | Name of the collection storing keys |
+| `WithCollectionName` | `"apiKeys"` | Name of the collection storing keys |
 | `WithCollectionID` | `"pbc_apikeys_plugin"` | Stable ID for the collection |
 | `WithMaxKeysPerUser` | `0` (unlimited) | Max active keys per user |
 
@@ -112,10 +112,10 @@ The collection's API rules enforce that users can only operate on their own keys
 
 | Operation | Endpoint |
 |---|---|
-| List your keys | `GET /api/collections/api_keys/records` |
-| View a key | `GET /api/collections/api_keys/records/:id` |
-| Disable (revoke) | `PATCH /api/collections/api_keys/records/:id` with `{"disabled":true}` |
-| Delete | `DELETE /api/collections/api_keys/records/:id` |
+| List your keys | `GET /api/collections/apiKeys/records` |
+| View a key | `GET /api/collections/apiKeys/records/:id` |
+| Disable (revoke) | `PATCH /api/collections/apiKeys/records/:id` with `{"disabled":true}` |
+| Delete | `DELETE /api/collections/apiKeys/records/:id` |
 
 All require a valid JWT auth token. The raw `key` value is **never** exposed through these endpoints.
 

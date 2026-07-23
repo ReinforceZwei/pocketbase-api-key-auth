@@ -5,7 +5,7 @@ import (
 	"github.com/pocketbase/pocketbase/tools/types"
 )
 
-// desiredCollection returns the canonical schema for the api_keys collection.
+// desiredCollection returns the canonical schema for the apiKeys collection.
 // This is the single source of truth for the schema. To evolve the schema,
 // only this function needs to change.
 func desiredCollection(cfg Config) *core.Collection {

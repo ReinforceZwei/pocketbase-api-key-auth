@@ -41,10 +41,10 @@ package apikeyauth
 // All fields are optional — defaults are applied via DefaultConfig().
 type Config struct {
     // CollectionName is the name of the collection that stores API keys.
-    // Default: "api_keys"
+    // Default: "apiKeys"
     CollectionName string
 
-    // CollectionID is the stable ID for the api_keys collection.
+    // CollectionID is the stable ID for the apiKeys collection.
     // Changing this after initial deployment is NOT recommended — existing
     // records won't be found. Default: "pbc_apikeys_plugin"
     CollectionID string
@@ -77,7 +77,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
     return Config{
-        CollectionName: "api_keys",
+        CollectionName: "apiKeys",
         CollectionID:   "pbc_apikeys_plugin",
         HeaderName:     "X-API-Key",
         ApiPath:        "/api/api-key",
@@ -225,7 +225,7 @@ func validateKeyPrefix(prefix string) error {
 
 ### `desiredCollection(cfg Config) *core.Collection`
 
-The `api_keys` collection schema. Each user can have multiple keys, each identified by a user-defined `name`.
+The `apiKeys` collection schema. Each user can have multiple keys, each identified by a user-defined `name`.
 
 ```go
 func desiredCollection(cfg Config) *core.Collection {
@@ -324,7 +324,7 @@ func Register(app core.App, opts ...Option) {
         panic(fmt.Sprintf("apikeyauth: invalid key prefix: %v", err))
     }
 
-    // OnBootstrap: ensure the api_keys collection exists / is migrated
+    // OnBootstrap: ensure the apiKeys collection exists / is migrated
     app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
         if err := e.Next(); err != nil {
             return err
@@ -412,7 +412,7 @@ func apiKeyAuthMiddleware(app core.App, cfg Config) func(e *core.RequestEvent) e
 
 ## 6. API Handler (Create Only)
 
-Other operations (list, view, update, disable, delete) are performed through PocketBase's built-in Record API (`/api/collections/api_keys/records`). The collection's API rules (section 3) enforce that users can only operate on their own keys.
+Other operations (list, view, update, disable, delete) are performed through PocketBase's built-in Record API (`/api/collections/apiKeys/records`). The collection's API rules (section 3) enforce that users can only operate on their own keys.
 
 ### `POST /api/api-key` — Create a new API key
 
@@ -484,7 +484,7 @@ func createAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) er
         // Find the collection
         collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
         if err != nil {
-            return e.InternalServerError("api_keys collection not found", err)
+            return e.InternalServerError("apiKeys collection not found", err)
         }
 
         // Create the record
@@ -568,7 +568,7 @@ func ensureCollection(app core.App, cfg Config) error {
 │  1. Client sends header: X-API-Key: pbk_dGhpcyBpcy...       │
 │  2. Middleware checks prefix "pbk_" — reject early if wrong  │
 │  3. Hash incoming key: security.SHA256("pbk_dGhpcyBpcy...")  │
-│  4. DB lookup: SELECT * FROM api_keys WHERE key_hash = ?     │
+│  4. DB lookup: SELECT * FROM apiKeys WHERE key_hash = ?     │
 │  5. Check: disabled? expires_at in past? → skip              │
 │  6. Resolve user → set e.Auth                                │
 └──────────────────────────────────────────────────────────────┘
@@ -612,7 +612,7 @@ func ensureCollection(app core.App, cfg Config) error {
 | `POST` | `/api/api-key` (configurable) | `RequireAuth` | Create a new API key. Returns raw key **once**. |
 | *(middleware)* | `*` | none | Reads configured header, authenticates via API key if present. |
 
-> **Other operations** (list, view, update, disable, delete) are handled through PocketBase's built-in Record API at `/api/collections/api_keys/records`. The collection's API rules (`user = @request.auth.id`) enforce ownership.
+> **Other operations** (list, view, update, disable, delete) are handled through PocketBase's built-in Record API at `/api/collections/apiKeys/records`. The collection's API rules (`user = @request.auth.id`) enforce ownership.
 
 ---
 

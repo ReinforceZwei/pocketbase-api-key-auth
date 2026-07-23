@@ -73,7 +73,7 @@ func createAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) er
 		// Find the collection
 		collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
 		if err != nil {
-			return e.InternalServerError("api_keys collection not found", err)
+			return e.InternalServerError("apiKeys collection not found", err)
 		}
 
 		// Create the record

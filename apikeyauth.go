@@ -17,10 +17,10 @@ import (
 // All fields are optional — defaults are applied via [DefaultConfig].
 type Config struct {
 	// CollectionName is the name of the collection that stores API keys.
-	// Default: "api_keys"
+	// Default: "apiKeys"
 	CollectionName string
 
-	// CollectionID is the stable ID for the api_keys collection.
+	// CollectionID is the stable ID for the apiKeys collection.
 	// Changing this after initial deployment is NOT recommended.
 	// Default: "pbc_apikeys_plugin"
 	CollectionID string
@@ -112,7 +112,7 @@ func Register(app core.App, opts ...Option) {
 		log.Fatalf("apikeyauth: invalid key prefix: %v", err)
 	}
 
-	// OnBootstrap: ensure the api_keys collection exists / is migrated
+	// OnBootstrap: ensure the apiKeys collection exists / is migrated
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {
 			return err

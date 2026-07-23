@@ -194,8 +194,8 @@ func TestDefaultConfig(t *testing.T) {
 
 	cfg := DefaultConfig()
 
-	if cfg.CollectionName != "api_keys" {
-		t.Errorf("expected CollectionName 'api_keys', got %q", cfg.CollectionName)
+	if cfg.CollectionName != "apiKeys" {
+		t.Errorf("expected CollectionName 'apiKeys', got %q", cfg.CollectionName)
 	}
 	if cfg.CollectionID != "pbc_apikeys_plugin" {
 		t.Errorf("expected CollectionID 'pbc_apikeys_plugin', got %q", cfg.CollectionID)
