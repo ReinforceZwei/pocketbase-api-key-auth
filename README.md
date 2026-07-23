@@ -67,7 +67,7 @@ apikeyauth.Register(app,
 | `WithHeaderName` | `"X-API-Key"` | HTTP header to read the API key from |
 | `WithApiPath` | `"/api/api-key"` | Route for the key creation endpoint |
 | `WithKeyPrefix` | `"pbk_"` | Prefix for all generated keys |
-| `WithKeyLength` | `43` | Random `[A-Za-z0-9]` characters after prefix |
+| `WithKeyLength` | `43` | Random `[A-Za-z0-9]` characters after prefix. Minimum: 32 |
 | `WithCollectionName` | `"apiKeys"` | Name of the collection storing keys |
 | `WithCollectionID` | `"pbc_apikeys_plugin"` | Stable ID for the collection |
 | `WithMaxKeysPerUser` | `0` (unlimited) | Max active keys per user |
@@ -105,19 +105,44 @@ Requires a valid PocketBase auth token (JWT). Returns the raw API key **once** �
 }
 ```
 
-### Managing keys via PocketBase Record API
+### `PATCH /api/api-key/:id` (or your configured path)
 
-List, view, update, disable, and delete keys through PocketBase's built-in Record API.  
-The collection's API rules enforce that users can only operate on their own keys.
+Update a key's metadata. Only `name`, `disabled`, and `expires_at` are mutable — `user`, `key_hash`, and `key_prefix` are rejected as immutable. Requires a valid JWT token and you must own the key.
+
+**Request:**
+
+```json
+{
+    "name": "Renamed Key",
+    "disabled": true,
+    "expires_at": "2027-06-01 00:00:00.000Z"
+}
+```
+
+**Response `200`:** the updated record.
+
+### `DELETE /api/api-key/:id` (or your configured path)
+
+Delete a key permanently. Requires a valid JWT token and you must own the key.
+
+**Response `200`:**
+
+```json
+{ "message": "API key deleted" }
+```
+
+### Listing and viewing keys via PocketBase Record API
+
+List and view operations are still available through PocketBase's built-in Record API.
+Generic create and update are **intentionally disabled** — use the dedicated endpoints above instead.
 
 | Operation | Endpoint |
 |---|---|
 | List your keys | `GET /api/collections/apiKeys/records` |
 | View a key | `GET /api/collections/apiKeys/records/:id` |
-| Disable (revoke) | `PATCH /api/collections/apiKeys/records/:id` with `{"disabled":true}` |
-| Delete | `DELETE /api/collections/apiKeys/records/:id` |
 
-All require a valid JWT auth token. The raw `key` value is **never** exposed through these endpoints.
+All require a valid JWT auth token. The `key_hash` field is hidden from API responses.
+The raw `key` value is **never** exposed through these endpoints.
 
 ### Authenticating requests
 
@@ -149,7 +174,7 @@ Each key has two parts:
 
 | Field | Type | Purpose |
 |---|---|---|
-| `key_hash` | text(64) | SHA-256 hex of the full key |
+| `key_hash` | text(64) | SHA-256 hex of the full key (hidden from API responses) |
 | `key_prefix` | text(8) | Prefix portion for early rejection + auditing |
 | `name` | text(100) | User-defined label |
 | `user` | relation→users | Key owner |
@@ -201,22 +226,22 @@ go mod download
 ### Run tests
 
 ```
-go test -v -count=1 ./apikeyauth/
+go test -v -count=1 ./...
 ```
 
-All 26 tests cover: key generation, prefix validation, collection schema, config options, `ensureCollection` bootstrap/migration, middleware authentication (valid key, disabled key, wrong prefix, nonexistent key, JWT skip, guest pass-through), and the creation handler (success, validation, auth, max-limit enforcement, expiry, custom path).
+All 52 tests cover: key generation, prefix validation, config validation (including minimum key length), collection schema, config options, `ensureCollection` bootstrap/migration, middleware authentication (valid key, disabled key, wrong prefix, nonexistent key, JWT skip, guest pass-through), the creation handler (success, validation, auth, max-limit enforcement, expiry, custom path), update/delete handlers (rename, disable, set expiry, immutable field rejection, ownership enforcement), and generic Record API blocks (create/update disabled).
 
 ### Project structure
 
 ```
-├── apikeyauth/
-│   ├── apikeyauth.go        # Config, Option funcs, Register()
-│   ├── collection.go        # desiredCollection(), ensureCollection()
-│   ├── keygen.go            # generateAPIKey(), validateKeyPrefix()
-│   ├── middleware.go        # apiKeyAuthMiddleware()
-│   ├── handlers.go          # POST create handler
-│   └── apikeyauth_test.go   # Unit + integration tests
+├── apikeyauth.go            # Config, Option funcs, Register(), validateConfig()
+├── collection.go            # desiredCollection(), ensureCollection()
+├── keygen.go                # generateAPIKey(), validateKeyPrefix(), MinKeyLength
+├── middleware.go             # apiKeyAuthMiddleware()
+├── handlers.go              # create/update/delete handlers
+├── apikeyauth_test.go       # Unit + integration tests (52 tests)
 ├── api-key-plugin-design.md # Full design document
+├── security-review.md       # Security audit findings
 ├── README.md
 ├── go.mod
 └── go.sum
@@ -232,7 +257,7 @@ This is a Go library — follow standard module versioning with git tags.
 
 1. **Ensure tests pass:**
    ```
-   go test -count=1 ./apikeyauth/
+   go test -count=1 ./...
    ```
 
 2. **Tag and push:**
