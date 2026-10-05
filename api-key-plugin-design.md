@@ -20,7 +20,7 @@ apikeyauth/
 ├── apikeyauth.go       # Config, Register(), functional options, public API
 ├── collection.go       # desiredCollection(), ensureCollection()
 ├── middleware.go        # apiKeyAuthMiddleware()
-├── handlers.go          # POST /api/api-key (create only; other ops via PocketBase CRUD)
+├── hooks.go             # OnRecordCreateRequest / OnRecordUpdateRequest hooks
 ├── keygen.go            # generateAPIKey(), validateKeyPrefix()
 ├── apikeyauth_test.go   # Tests
 └── README.md
@@ -53,10 +53,6 @@ type Config struct {
     // Default: "X-API-Key"
     HeaderName string
 
-    // ApiPath is the route path for the key creation endpoint.
-    // Default: "/api/api-key"
-    ApiPath string
-
     // KeyPrefix is prepended to every generated API key.
     // Used for identification, auditing, and secret scanning.
     // Must be 3–8 alphanumeric characters + trailing underscore.
@@ -80,7 +76,6 @@ func DefaultConfig() Config {
         CollectionName: "apiKeys",
         CollectionID:   "pbc_apikeys_plugin",
         HeaderName:     "X-API-Key",
-        ApiPath:        "/api/api-key",
         KeyPrefix:      "pbk_",
         KeyLength:      43,
         MaxKeysPerUser: 0,
@@ -103,11 +98,6 @@ func WithCollectionID(id string) Option {
 // WithHeaderName overrides the header used to pass the API key.
 func WithHeaderName(name string) Option {
     return func(c *Config) { c.HeaderName = name }
-}
-
-// WithApiPath overrides the API route path for key creation.
-func WithApiPath(path string) Option {
-    return func(c *Config) { c.ApiPath = path }
 }
 
 // WithKeyPrefix overrides the key prefix (e.g. "myapp_").
@@ -143,7 +133,6 @@ func main() {
     apikeyauth.Register(app,
         apikeyauth.WithHeaderName("X-MyApp-Key"),
         apikeyauth.WithKeyPrefix("myapp_"),
-        apikeyauth.WithApiPath("/api/custom-keys"),
         apikeyauth.WithMaxKeysPerUser(5),
     )
 
@@ -273,6 +262,18 @@ func desiredCollection(cfg Config) *core.Collection {
         Name: "expires_at",
     })
 
+    // created / updated: autodate fields, so built-in API responses carry the
+    // same timestamps as any other PocketBase collection
+    c.Fields.Add(&core.AutodateField{
+        Name:     "created",
+        OnCreate: true,
+    })
+    c.Fields.Add(&core.AutodateField{
+        Name:     "updated",
+        OnCreate: true,
+        OnUpdate: true,
+    })
+
     // --- Indexes ---
 
     c.Indexes = append(c.Indexes,
@@ -283,10 +284,12 @@ func desiredCollection(cfg Config) *core.Collection {
     )
 
     // --- API Rules (for the built-in record API) ---
-    // Only the owner can list/view/update/delete their own keys
+    // Every operation is scoped to the key owner. Create and Update are the
+    // entry points for the request hooks (section 6): the rules are the first
+    // gate, the hooks the second.
     c.ListRule   = types.Pointer("user = @request.auth.id")
     c.ViewRule   = types.Pointer("user = @request.auth.id")
-    c.CreateRule = types.Pointer("user = @request.auth.id")
+    c.CreateRule = types.Pointer("@request.auth.id != '' && user = @request.auth.id")
     c.UpdateRule = types.Pointer("user = @request.auth.id")
     c.DeleteRule = types.Pointer("user = @request.auth.id")
 
@@ -309,7 +312,7 @@ func desiredCollection(cfg Config) *core.Collection {
 
 ---
 
-## 4. `Register()` — Updated
+## 4. `Register()`
 
 ```go
 // Register wires the plugin into a PocketBase app. Must be called before app.Start().
@@ -332,15 +335,16 @@ func Register(app core.App, opts ...Option) {
         return ensureCollection(app, cfg)
     })
 
-    // OnServe: register middleware + API routes
+    // OnServe: authenticate requests carrying an API key header
     app.OnServe().BindFunc(func(se *core.ServeEvent) error {
-        se.Router.Use(apiKeyAuthMiddleware(app, cfg))
-
-        // Mount the key creation endpoint (other operations via PocketBase CRUD)
-        se.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg), apis.RequireAuth())
+        se.Router.BindFunc(apiKeyAuthMiddleware(app, cfg))
 
         return se.Next()
     })
+
+    // Key CRUD is handled by the built-in Record API endpoints, intercepted
+    // with PocketBase's request hooks (section 6) - no custom routes are mounted.
+    registerRequestHooks(app, cfg)
 }
 ```
 
@@ -410,111 +414,91 @@ func apiKeyAuthMiddleware(app core.App, cfg Config) func(e *core.RequestEvent) e
 
 ---
 
-## 6. API Handler (Create Only)
+## 6. Request Hooks (Create & Update)
 
-Other operations (list, view, update, disable, delete) are performed through PocketBase's built-in Record API (`/api/collections/apiKeys/records`). The collection's API rules (section 3) enforce that users can only operate on their own keys.
+The apiKeys CRUD surface *is* PocketBase's built-in Record API
+(`/api/collections/apiKeys/records`). Server-side logic is attached with the
+designated request hooks instead of custom routes, so the REST API, the JS SDK
+and the batch API all behave like any other collection.
 
-### `POST /api/api-key` — Create a new API key
+### Hook ordering (PocketBase v0.39, `apis/record_crud.go`)
 
-**Request body (JSON):**
+```
+1. body parsed into normalized request data
+2. hidden fields dropped for non-superusers
+3. create rule checked against the submitted (dummy) record
+4. form.Load(data)                       - only known collection fields
+5. -- OnRecordCreateRequest / OnRecordUpdateRequest --   <- plugin logic
+6. system handler: form.Submit() -> save -> JSON response
+```
+
+The plugin hooks therefore run *after* the request body has been loaded into
+`e.Record` but *before* validation and save: mutate `e.Record`, then `e.Next()`.
+
+| Concern | How it is handled |
+|---|---|
+| key generation & hashing | `OnRecordCreateRequest` replaces `key_hash` / `key_prefix` |
+| ownership | create rule (`user = @request.auth.id`) **and** the hook forces `user` to the caller |
+| `MaxKeysPerUser` | counted inside the create hook (`disabled = false` only) |
+| immutable fields | `OnRecordUpdateRequest` rejects `user`, `key_hash`, `key_prefix`, `key`, `id`, `created`, `updated` from the raw body, then re-applies the stored values as a second gate |
+| malformed `expires_at` | rejected explicitly - see note below |
+| deleting a key | no hook needed; `DeleteRule` restricts it to the owner |
+
+### Returning the raw key once
+
+There is no response hook, so the one-time `key` is attached as *custom record
+data*: `PublicExport()` (used by `MarshalJSON`) serializes it, while `DBExport()`
+and therefore the SQL INSERT iterate collection fields only.
+
+```go
+e.Record.WithCustomData(true)
+e.Record.Set("key", rawKey)   // in the response, never in the database
+```
+
+### Raw body vs. `RequestInfo().Body`
+
+`RequestInfo().Body` holds the *normalized* values: an unparseable date has
+already been replaced with an empty value there, and hidden fields are filtered
+out. Immutability checks and date validation therefore re-read the raw body with
+`e.BindBody` (the router wraps the body in a rereadable reader, so this is safe).
+
+### Request body / response (`POST /api/collections/apiKeys/records`)
+
+**Request:**
 ```json
 {
     "name": "My CI Server",
-    "expires_at": "2027-01-01T00:00:00Z"   // optional
+    "user": "user123",
+    "expires_at": "2027-01-01T00:00:00Z"
 }
 ```
 
-**Response (201 Created):**
+`user` must be the caller's own id (the create rule rejects anything else).
+`key_hash`, `key_prefix` and `disabled` are server-owned: if submitted they are
+overwritten on create and rejected on update.
+
+**Response (200):** the record, plus the raw key exactly once.
+
 ```json
 {
     "id": "abc123",
+    "collectionId": "pbc_apikeys_plugin",
+    "collectionName": "apiKeys",
     "name": "My CI Server",
-    "key": "pbk_dGhpcyBpcyBhIHNlY3JldCBrZXk",
+    "key": "pbk_aB3xK9mW2qR7tY5vN8cL1pF4dG6hJ0sA",
     "key_prefix": "pbk_",
     "user": "user123",
     "disabled": false,
-    "expires_at": "2027-01-01T00:00:00Z",
-    "created": "2026-07-17T12:00:00Z",
-    "updated": "2026-07-17T12:00:00Z"
+    "expires_at": "2027-01-01 00:00:00.000Z",
+    "created": "2026-07-20 12:00:00.000Z",
+    "updated": "2026-07-20 12:00:00.000Z"
 }
 ```
 
-> **Critical**: The raw `key` field is returned **only once** in this response. It is never stored in plaintext — only `key_hash` is persisted. There is no endpoint to retrieve a lost key; the user must create a new one.
+`key_hash` is a hidden field and never appears in any response.
 
-**Implementation:**
-
-```go
-func createAPIKeyHandler(app core.App, cfg Config) func(e *core.RequestEvent) error {
-    return func(e *core.RequestEvent) error {
-        // Parse request body
-        var body struct {
-            Name      string `json:"name"`
-            ExpiresAt string `json:"expires_at"` // optional, ISO 8601
-        }
-        if err := e.BindBody(&body); err != nil {
-            return e.BadRequestError("invalid request body", err)
-        }
-
-        if strings.TrimSpace(body.Name) == "" {
-            return e.BadRequestError("name is required", nil)
-        }
-
-        // Enforce max keys per user limit
-        if cfg.MaxKeysPerUser > 0 {
-            activeKeys, err := app.FindRecordsByFilter(
-                cfg.CollectionName,
-                "user = {:userId} && disabled = false",
-                "", 0, 0,
-                dbx.Params{"userId": e.Auth.Id},
-            )
-            if err != nil {
-                return e.InternalServerError("failed to check key count", err)
-            }
-            if len(activeKeys) >= cfg.MaxKeysPerUser {
-                return e.BadRequestError(
-                    fmt.Sprintf("maximum of %d active API keys reached", cfg.MaxKeysPerUser),
-                    nil,
-                )
-            }
-        }
-
-        // Generate the key (no error possible — security.RandomString always succeeds)
-        rawKey, keyHash := generateAPIKey(cfg.KeyPrefix, cfg.KeyLength)
-
-        // Find the collection
-        collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
-        if err != nil {
-            return e.InternalServerError("apiKeys collection not found", err)
-        }
-
-        // Create the record
-        record := core.NewRecord(collection)
-        record.Set("name", strings.TrimSpace(body.Name))
-        record.Set("key_hash", keyHash)
-        record.Set("key_prefix", cfg.KeyPrefix)
-        record.Set("user", e.Auth.Id)
-        record.Set("disabled", false)
-
-        if body.ExpiresAt != "" {
-            t, err := time.Parse(time.RFC3339, body.ExpiresAt)
-            if err != nil {
-                return e.BadRequestError("invalid expires_at format, use ISO 8601", err)
-            }
-            record.Set("expires_at", t)
-        }
-
-        if err := app.Save(record); err != nil {
-            return e.InternalServerError("failed to save API key", err)
-        }
-
-        // Return the record WITH the raw key (one-time only)
-        result := record.PublicExport()
-        result["key"] = rawKey // injected manually — not stored in DB
-
-        return e.JSON(http.StatusCreated, result)
-    }
-}
-```
+> **Critical**: the raw `key` is returned **only once**. Only `key_hash` is
+> persisted; there is no endpoint to retrieve a lost key.
 
 ---
 
@@ -550,7 +534,7 @@ func ensureCollection(app core.App, cfg Config) error {
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                    KEY CREATION (POST /api/api-key)           │
+│                    KEY CREATION (POST /api/collections/apiKeys/records)           │
 │                                                              │
 │  1. User sends: { "name": "My Key", "expires_at": "..." }    │
 │  2. Server calls generateAPIKey("pbk_", 43)                  │
@@ -607,12 +591,18 @@ func ensureCollection(app core.App, cfg Config) error {
 
 ## 10. Complete API Surface
 
+No custom routes are mounted. The whole surface is PocketBase's built-in Record
+API for the `apiKeys` collection, plus the authentication middleware.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/api/api-key` (configurable) | `RequireAuth` | Create a new API key. Returns raw key **once**. |
-| *(middleware)* | `*` | none | Reads configured header, authenticates via API key if present. |
-
-> **Other operations** (list, view, update, disable, delete) are handled through PocketBase's built-in Record API at `/api/collections/apiKeys/records`. The collection's API rules (`user = @request.auth.id`) enforce ownership.
+| `POST` | `/api/collections/apiKeys/records` | JWT + create rule | Create a key. Returns the raw key **once**, generated by the request hook. |
+| `PATCH` / `PUT` | `/api/collections/apiKeys/records/:id` | JWT + update rule | Update `name`, `disabled`, `expires_at` of your own key. |
+| `GET` | `/api/collections/apiKeys/records` | JWT + list rule | List your own keys (filters, sort, pagination as usual). |
+| `GET` | `/api/collections/apiKeys/records/:id` | JWT + view rule | View one of your own keys. |
+| `DELETE` | `/api/collections/apiKeys/records/:id` | JWT + delete rule | Delete your own key (204). |
+| `POST` | `/api/batch` | JWT (batch must be enabled) | Batched requests go through the same hooks. |
+| *(middleware)* | `*` | none | Reads the configured header and authenticates via API key if present. |
 
 ---
 
@@ -631,8 +621,10 @@ func ensureCollection(app core.App, cfg Config) error {
 | `expires_at` as optional datetime | Simple; checked in middleware; no background job needed |
 | Unique index on `(user, name)` | Prevents duplicate names per user; enforces user-friendly naming |
 | `unlimited` max keys by default (`MaxKeysPerUser: 0`) | Backwards compatible; opt-in throttling |
-| API route at configurable path, defaults to `/api/api-key` | Consumer-controlled; avoids route conflicts |
-| Other operations via PocketBase CRUD | No need to duplicate list/view/update/delete handlers; PocketBase's Record API + API rules handle ownership enforcement |
+| Request hooks instead of custom routes | Clients (REST, JS SDK, batch) use the standard collection endpoints; no route conflicts; no duplicated CRUD plumbing |
+| `Record.WithCustomData(true)` for the one-time key | Response bodies cannot be rewritten from a hook; custom data is exported but never persisted |
+| Raw body (not `RequestInfo().Body`) for immutable/date checks | `RequestInfo().Body` is normalized: garbage dates and hidden fields are already gone by hook time |
+| Create rule `@request.auth.id != '' && user = @request.auth.id` | Rejects guest and impersonating creates before the hook runs; the hook then forces the stored owner |
 | `desiredCollection()` as schema source of truth | Single place to update; no SQL migration files; no version tracking |
 | Silently skip invalid keys (no error response) | Mirrors `loadAuthToken()` behavior; lets downstream `RequireAuth` decide the 401 |
 | Configurable header name (not `Authorization`) | Avoids collision with JWT; customer can choose their own header convention |
@@ -646,6 +638,6 @@ func ensureCollection(app core.App, cfg Config) error {
 | **Phase 1** | `apikeyauth.go`, `collection.go` | `Config`, `Option` funcs, `desiredCollection()`, `ensureCollection()`, `Register()` |
 | **Phase 2** | `keygen.go` | `generateAPIKey()`, `validateKeyPrefix()` |
 | **Phase 3** | `middleware.go` | `apiKeyAuthMiddleware()` with hashing, prefix check, disabled check, expiry check |
-| **Phase 4** | `handlers.go` | `POST /api/api-key` (create only) |
-| **Phase 5** | `apikeyauth_test.go` | Unit tests for keygen, middleware, handlers; integration test with test app |
+| **Phase 4** | `hooks.go` | `OnRecordCreateRequest` / `OnRecordUpdateRequest` request hooks |
+| **Phase 5** | `apikeyauth_test.go` | Unit tests for keygen, middleware, hooks; API scenarios + end-to-end test |
 | **Phase 6** | `README.md` | Usage docs, API docs, examples |
