@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -29,10 +28,6 @@ type Config struct {
 	// HeaderName is the HTTP header to read the API key from.
 	// Default: "X-API-Key"
 	HeaderName string
-
-	// ApiPath is the route path for the key creation endpoint.
-	// Default: "/api/api-key"
-	ApiPath string
 
 	// KeyPrefix is prepended to every generated API key.
 	// Must be 3–8 alphanumeric characters + trailing underscore.
@@ -55,7 +50,6 @@ func DefaultConfig() Config {
 		CollectionName: "apiKeys",
 		CollectionID:   "pbc_apikeys_plugin",
 		HeaderName:     "X-API-Key",
-		ApiPath:        "/api/api-key",
 		KeyPrefix:      "pbk_",
 		KeyLength:      43,
 		MaxKeysPerUser: 0,
@@ -78,11 +72,6 @@ func WithCollectionID(id string) Option {
 // WithHeaderName overrides the header used to pass the API key.
 func WithHeaderName(name string) Option {
 	return func(c *Config) { c.HeaderName = name }
-}
-
-// WithApiPath overrides the API route path for key creation.
-func WithApiPath(path string) Option {
-	return func(c *Config) { c.ApiPath = path }
 }
 
 // WithKeyPrefix overrides the key prefix (e.g. "myapp_").
@@ -121,25 +110,17 @@ func Register(app core.App, opts ...Option) {
 		return ensureCollection(app, cfg)
 	})
 
-	// OnServe: register middleware + API routes
+	// OnServe: authenticate requests carrying an API key header
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		// Global middleware — runs on every request, checks for API key
 		se.Router.BindFunc(apiKeyAuthMiddleware(app, cfg))
 
-		// Key creation endpoint
-		se.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-			Bind(apis.RequireAuth())
-
-		// Key update endpoint (only name, disabled, expires_at are allowed)
-		se.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-			Bind(apis.RequireAuth())
-
-		// Key deletion endpoint
-		se.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
-			Bind(apis.RequireAuth())
-
 		return se.Next()
 	})
+
+	// Key CRUD is handled by the built-in Record API endpoints, intercepted
+	// with PocketBase's request hooks — see registerRequestHooks.
+	registerRequestHooks(app, cfg)
 }
 
 // validateConfig checks that the plugin configuration is safe and valid.

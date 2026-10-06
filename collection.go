@@ -51,6 +51,18 @@ func desiredCollection(cfg Config) *core.Collection {
 		Name: "expires_at",
 	})
 
+	// created / updated: autodate fields, so that the built-in API responses
+	// carry the same timestamps as any other PocketBase collection.
+	c.Fields.Add(&core.AutodateField{
+		Name:     "created",
+		OnCreate: true,
+	})
+	c.Fields.Add(&core.AutodateField{
+		Name:     "updated",
+		OnCreate: true,
+		OnUpdate: true,
+	})
+
 	// Indexes
 	c.Indexes = append(c.Indexes,
 		// Fast lookup by hash (primary lookup path)
@@ -60,14 +72,15 @@ func desiredCollection(cfg Config) *core.Collection {
 	)
 
 	// API Rules — only the owner can access their own keys.
-	// Create and Update are explicitly disabled: the custom handlers
-	// (POST/PATCH/DELETE /api/api-key) are the only supported paths
-	// for creating and mutating key records. This prevents impersonation
-	// via generic record endpoints (see security-review.md).
+	//
+	// Create and Update are enabled: they are the entry points for the request
+	// hooks in hooks.go, which generate the key material, force ownership and
+	// reject changes to immutable fields. The rules themselves are one layer of
+	// that protection — a create request has to name its own owner to pass.
 	c.ListRule = types.Pointer("user = @request.auth.id")
 	c.ViewRule = types.Pointer("user = @request.auth.id")
-	c.CreateRule = nil
-	c.UpdateRule = nil
+	c.CreateRule = types.Pointer("@request.auth.id != '' && user = @request.auth.id")
+	c.UpdateRule = types.Pointer("user = @request.auth.id")
 	c.DeleteRule = types.Pointer("user = @request.auth.id")
 
 	return c
@@ -90,9 +103,28 @@ func ensureCollection(app core.App, cfg Config) error {
 
 	// Avoid expensive no-op save
 	if existing.Fields.String() == desired.Fields.String() &&
-		existing.Indexes.String() == desired.Indexes.String() {
+		existing.Indexes.String() == desired.Indexes.String() &&
+		rulesEqual(existing, desired) {
 		return nil
 	}
 
 	return app.Save(desired) // SyncRecordTableSchema runs automatically
+}
+
+// rulesEqual reports whether the API rules of both collections match.
+// Rules are part of the plugin's contract (a rule change must be applied on
+// upgrade, not only on a field change).
+func rulesEqual(a, b *core.Collection) bool {
+	return ptrEqual(a.ListRule, b.ListRule) &&
+		ptrEqual(a.ViewRule, b.ViewRule) &&
+		ptrEqual(a.CreateRule, b.CreateRule) &&
+		ptrEqual(a.UpdateRule, b.UpdateRule) &&
+		ptrEqual(a.DeleteRule, b.DeleteRule)
+}
+
+func ptrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }

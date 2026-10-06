@@ -1,7 +1,11 @@
 package apikeyauth
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -141,10 +145,10 @@ func TestDesiredCollection(t *testing.T) {
 		fieldNames[i] = f.GetName()
 	}
 
-	expectedFields := []string{"name", "key_hash", "key_prefix", "user", "disabled", "expires_at"}
-	// Field count: 6 custom fields + 1 auto system field (id) = 7
-	if len(c.Fields) != 7 {
-		t.Errorf("expected 7 fields (6 custom + id), got %d", len(c.Fields))
+	expectedFields := []string{"name", "key_hash", "key_prefix", "user", "disabled", "expires_at", "created", "updated"}
+	// Field count: 8 custom fields + 1 auto system field (id) = 9
+	if len(c.Fields) != 9 {
+		t.Errorf("expected 9 fields (8 custom + id), got %d", len(c.Fields))
 	}
 
 	for _, name := range expectedFields {
@@ -159,20 +163,22 @@ func TestDesiredCollection(t *testing.T) {
 		t.Errorf("expected 2 indexes, got %d", len(c.Indexes))
 	}
 
-	// API Rules
-	if c.ListRule == nil || *c.ListRule != "user = @request.auth.id" {
+	// API Rules — every operation is scoped to the key owner. Create and Update
+	// are the entry points for the request hooks (see hooks.go).
+	const ownerRule = "user = @request.auth.id"
+	if c.ListRule == nil || *c.ListRule != ownerRule {
 		t.Error("ListRule not set correctly")
 	}
-	if c.ViewRule == nil || *c.ViewRule != "user = @request.auth.id" {
+	if c.ViewRule == nil || *c.ViewRule != ownerRule {
 		t.Error("ViewRule not set correctly")
 	}
-	if c.CreateRule != nil {
-		t.Error("CreateRule should be nil (generic create disabled)")
+	if c.CreateRule == nil || *c.CreateRule != "@request.auth.id != '' && "+ownerRule {
+		t.Error("CreateRule not set correctly")
 	}
-	if c.UpdateRule != nil {
-		t.Error("UpdateRule should be nil (generic update disabled)")
+	if c.UpdateRule == nil || *c.UpdateRule != ownerRule {
+		t.Error("UpdateRule not set correctly")
 	}
-	if c.DeleteRule == nil || *c.DeleteRule != "user = @request.auth.id" {
+	if c.DeleteRule == nil || *c.DeleteRule != ownerRule {
 		t.Error("DeleteRule not set correctly")
 	}
 }
@@ -203,9 +209,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.HeaderName != "X-API-Key" {
 		t.Errorf("expected HeaderName 'X-API-Key', got %q", cfg.HeaderName)
 	}
-	if cfg.ApiPath != "/api/api-key" {
-		t.Errorf("expected ApiPath '/api/api-key', got %q", cfg.ApiPath)
-	}
 	if cfg.KeyPrefix != "pbk_" {
 		t.Errorf("expected KeyPrefix 'pbk_', got %q", cfg.KeyPrefix)
 	}
@@ -222,7 +225,6 @@ func TestConfigOptions(t *testing.T) {
 	WithCollectionName("my_keys")(&cfg)
 	WithCollectionID("abc123")(&cfg)
 	WithHeaderName("X-Custom-Key")(&cfg)
-	WithApiPath("/api/custom")(&cfg)
 	WithKeyPrefix("myapp_")(&cfg)
 	WithKeyLength(20)(&cfg)
 	WithMaxKeysPerUser(5)(&cfg)
@@ -235,9 +237,6 @@ func TestConfigOptions(t *testing.T) {
 	}
 	if cfg.HeaderName != "X-Custom-Key" {
 		t.Errorf("WithHeaderName failed: got %q", cfg.HeaderName)
-	}
-	if cfg.ApiPath != "/api/custom" {
-		t.Errorf("WithApiPath failed: got %q", cfg.ApiPath)
 	}
 	if cfg.KeyPrefix != "myapp_" {
 		t.Errorf("WithKeyPrefix failed: got %q", cfg.KeyPrefix)
@@ -355,6 +354,75 @@ func TestEnsureCollection_NoopOnSecondCall(t *testing.T) {
 	_, err = app.FindCollectionByNameOrId(cfg.CollectionName)
 	if err != nil {
 		t.Fatalf("collection should still exist: %v", err)
+	}
+}
+
+// TestEnsureCollection_MigratesLegacySchema ensures an existing collection
+// created by an earlier plugin version is upgraded in place: the autodate
+// fields are added and the (previously disabled) create/update rules are
+// applied, without touching the stored records.
+func TestEnsureCollection_MigratesLegacySchema(t *testing.T) {
+	t.Parallel()
+
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Cleanup()
+
+	cfg := DefaultConfig()
+
+	// Simulate the previous release: no created/updated fields, and the generic
+	// create/update endpoints turned off.
+	legacy := core.NewCollection(core.CollectionTypeBase, cfg.CollectionName, cfg.CollectionID)
+	legacy.Fields.Add(&core.TextField{Name: "name", Required: true, Max: 100})
+	legacy.Fields.Add(&core.TextField{Name: "key_hash", Required: true, Max: 64, Hidden: true})
+	legacy.Fields.Add(&core.TextField{Name: "key_prefix", Required: true, Max: 8})
+	legacy.Fields.Add(&core.RelationField{Name: "user", CollectionId: "_pb_users_auth_", MaxSelect: 1, Required: true})
+	legacy.Fields.Add(&core.BoolField{Name: "disabled"})
+	legacy.Fields.Add(&core.DateField{Name: "expires_at"})
+	legacy.ListRule = types.Pointer("user = @request.auth.id")
+	legacy.ViewRule = types.Pointer("user = @request.auth.id")
+	legacy.DeleteRule = types.Pointer("user = @request.auth.id")
+	legacy.CreateRule = nil
+	legacy.UpdateRule = nil
+
+	if err := app.Save(legacy); err != nil {
+		t.Fatalf("failed to save legacy collection: %v", err)
+	}
+
+	// an existing key record must survive the migration
+	createTestKeyRecord(app, t, cfg, testUserId, false, "")
+
+	if err := ensureCollection(app, cfg); err != nil {
+		t.Fatalf("ensureCollection failed: %v", err)
+	}
+
+	col, err := app.FindCollectionByNameOrId(cfg.CollectionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if col.Fields.GetByName("created") == nil || col.Fields.GetByName("updated") == nil {
+		t.Error("expected the autodate fields to be added on migration")
+	}
+	if col.CreateRule == nil || *col.CreateRule != "@request.auth.id != '' && user = @request.auth.id" {
+		t.Errorf("expected the create rule to be enabled on migration, got %v", col.CreateRule)
+	}
+	if col.UpdateRule == nil || *col.UpdateRule != "user = @request.auth.id" {
+		t.Errorf("expected the update rule to be enabled on migration, got %v", col.UpdateRule)
+	}
+
+	// reading the records back proves the new columns were really added
+	records, err := app.FindAllRecords(cfg.CollectionName)
+	if err != nil {
+		t.Fatalf("failed to read records after migration: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected the existing record to survive the migration, got %d", len(records))
+	}
+	if records[0].GetString("key_hash") == "" {
+		t.Error("expected the migrated record to keep its key_hash")
 	}
 }
 
@@ -560,36 +628,185 @@ func TestApiKeyAuthMiddleware_AlreadyAuthed(t *testing.T) {
 }
 
 // =============================================================================
-// Handler Tests — Create API Key
+// Create Tests — built-in Record API (POST /api/collections/apiKeys/records)
 // =============================================================================
 
-func TestCreateAPIKeyHandler_Success(t *testing.T) {
+// recordsURL is the built-in Record API endpoint for the apiKeys collection.
+const recordsURL = "/api/collections/apiKeys/records"
+
+// bootstrapHooks bootstraps the collection and registers the request hooks.
+func bootstrapHooks(app *tests.TestApp, t testing.TB, cfg Config) {
+	bootstrapPlugin(app, t, cfg)
+	registerRequestHooks(app, cfg)
+}
+
+// createTestKeyNamed inserts a key record with an explicit name, used to set up
+// unique-index conflicts.
+func createTestKeyNamed(app *tests.TestApp, t testing.TB, cfg Config, userId string, name string) {
+	collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
+	if err != nil {
+		t.Fatalf("failed to find collection: %v", err)
+	}
+
+	record := core.NewRecord(collection)
+	record.Set("name", name)
+	record.Set("key_hash", security.SHA256(cfg.KeyPrefix+security.RandomString(40)))
+	record.Set("key_prefix", cfg.KeyPrefix)
+	record.Set("user", userId)
+
+	if err := app.Save(record); err != nil {
+		t.Fatalf("failed to save test key record: %v", err)
+	}
+}
+
+// createSecondUser creates an additional user in the test app and returns its id.
+// Relation fields are validated, so ownership tests need a real user record.
+func createSecondUser(tb testing.TB, app *tests.TestApp) string {
+	collection, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	record := core.NewRecord(collection)
+	record.Set("email", "other@example.com")
+	record.Set("password", "password123456")
+	record.Set("verified", true)
+	if err := app.Save(record); err != nil {
+		tb.Fatal(err)
+	}
+
+	return record.Id
+}
+
+// superuserToken creates a superuser in the test app and returns its auth token.
+func superuserToken(tb testing.TB, app *tests.TestApp) string {
+	collection, err := app.FindCollectionByNameOrId(core.CollectionNameSuperusers)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	record := core.NewRecord(collection)
+	record.Set("email", "root@example.com")
+	record.Set("password", security.RandomString(20))
+	if err := app.Save(record); err != nil {
+		tb.Fatal(err)
+	}
+
+	token, err := record.NewAuthToken()
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	return token
+}
+
+func TestCreateKey_Success(t *testing.T) {
 	t.Parallel()
+
+	cfg := DefaultConfig()
 
 	scenarios := []tests.ApiScenario{
 		{
-			Name:   "create api key with valid name",
+			Name:   "owner can create a key and receives it once",
 			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{"name":"My Test Key"}`),
+			URL:    recordsURL,
+			Body: strings.NewReader(
+				`{"name":"CI Server","user":"` + testUserId + `","expires_at":"2027-01-01 00:00:00.000Z"}`),
 			Headers: map[string]string{
 				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
 			},
-			ExpectedStatus: 201,
+			ExpectedStatus: 200,
 			ExpectedContent: []string{
-				`"name":"My Test Key"`,
-				`"key":"pbk_`,
-				`"key_prefix":"pbk_"`,
+				`"name":"CI Server"`,
+				`"key":"` + cfg.KeyPrefix,
+				`"key_prefix":"` + cfg.KeyPrefix + `"`,
+				`"disabled":false`,
 				`"user":"` + testUserId + `"`,
+				`"expires_at":"2027-01-01 00:00:00.000Z"`,
+				// created/updated come from the autodate fields
+				`"created":"`,
+				`"updated":"`,
+			},
+			NotExpectedContent: []string{`"key_hash"`},
+			AfterTestFunc: func(tb testing.TB, app *tests.TestApp, res *http.Response) {
+				body, err := io.ReadAll(res.Body)
+				if err != nil {
+					tb.Fatal(err)
+				}
+
+				var created struct {
+					Key string `json:"key"`
+				}
+				if err := json.Unmarshal(body, &created); err != nil {
+					tb.Fatal(err)
+				}
+
+				records, err := app.FindAllRecords(cfg.CollectionName)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				if len(records) != 1 {
+					tb.Fatalf("expected exactly 1 record, got %d", len(records))
+				}
+
+				// The stored hash must match the returned key, and the plaintext
+				// value must not be reachable anywhere in the stored data.
+				storedHash := records[0].GetString("key_hash")
+				if storedHash != security.SHA256(created.Key) {
+					tb.Error("stored key_hash does not match the returned key")
+				}
+
+				// nothing that reaches SQL may contain the plaintext key
+				exported, err := records[0].DBExport(app)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				for column, value := range exported {
+					if strings.Contains(fmt.Sprint(value), created.Key) {
+						tb.Errorf("the plaintext key leaked into column %q", column)
+					}
+				}
+			},
+		},
+	}
+
+	for _, s := range scenarios {
+		s.Test(t)
+	}
+}
+
+func TestCreateKey_ServerOwnedFieldsAreForced(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:   "client supplied key_hash/key_prefix/disabled are overwritten",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body: strings.NewReader(`{"name":"forced","user":"` + testUserId + `",` +
+				`"key_hash":"deadbeefdeadbeefdeadbeefdeadbeef","key_prefix":"xxx_","disabled":true}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+			},
+			ExpectedStatus: 200,
+			ExpectedContent: []string{
+				`"key":"` + cfg.KeyPrefix,
+				`"key_prefix":"` + cfg.KeyPrefix + `"`,
 				`"disabled":false`,
 			},
+			NotExpectedContent: []string{
+				`"key_hash"`,
+				`"xxx_"`,
+				`deadbeef`,
+			},
 		},
 	}
 
@@ -598,45 +815,96 @@ func TestCreateAPIKeyHandler_Success(t *testing.T) {
 	}
 }
 
-func TestCreateAPIKeyHandler_NoName(t *testing.T) {
+func TestCreateKey_Validation(t *testing.T) {
 	t.Parallel()
+
+	cfg := DefaultConfig()
 
 	scenarios := []tests.ApiScenario{
 		{
-			Name:   "create api key without name — bad request",
+			Name:   "missing name fails field validation",
 			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{}`),
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"user":"` + testUserId + `"}`),
 			Headers: map[string]string{
 				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
 			},
-			ExpectedStatus:  400,
-			ExpectedContent: []string{`"status":400`},
+			ExpectedStatus: 400,
+			ExpectedContent: []string{
+				`"validation_required"`,
+			},
+			NotExpectedContent: []string{`"key"`},
 		},
 		{
-			Name:   "create api key with whitespace name — bad request",
+			Name:   "claiming another user as owner is rejected by the create rule",
 			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{"name":"   "}`),
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"sneaky","user":"someoneelse"}`),
 			Headers: map[string]string{
 				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
 			},
-			ExpectedStatus:  400,
-			ExpectedContent: []string{`"status":400`},
+			ExpectedStatus:     400,
+			NotExpectedContent: []string{`"key"`},
+		},
+		{
+			Name:   "omitting the owner is rejected by the create rule",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"ownerless"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+			},
+			ExpectedStatus:     400,
+			NotExpectedContent: []string{`"key"`},
+		},
+		{
+			Name:   "guest cannot create a key",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"guest","user":"` + testUserId + `"}`),
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+			},
+			ExpectedStatus:     400,
+			NotExpectedContent: []string{`"key"`},
+		},
+		{
+			Name:   "invalid expires_at is rejected",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"bad date","user":"` + testUserId + `","expires_at":"not-a-date"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+			},
+			ExpectedStatus:     400,
+			NotExpectedContent: []string{`"key"`},
+		},
+		{
+			Name:   "duplicate name per user is rejected by the unique index",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"duplicate","user":"` + testUserId + `"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				createTestKeyNamed(app, tb, cfg, testUserId, "duplicate")
+			},
+			ExpectedStatus:     400,
+			NotExpectedContent: []string{`"key"`},
 		},
 	}
 
@@ -645,26 +913,25 @@ func TestCreateAPIKeyHandler_NoName(t *testing.T) {
 	}
 }
 
-func TestCreateAPIKeyHandler_Unauthenticated(t *testing.T) {
+func TestCreateKey_ExpiryFormats(t *testing.T) {
 	t.Parallel()
+
+	cfg := DefaultConfig()
 
 	scenarios := []tests.ApiScenario{
 		{
-			Name:   "create api key without auth — unauthorized",
+			Name:   "ISO 8601 expiry is accepted and normalized",
 			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{"name":"Test"}`),
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"iso","user":"` + testUserId + `","expires_at":"2028-01-01T00:00:00Z"}`),
 			Headers: map[string]string{
-				"Content-Type": "application/json",
+				"Authorization": testUserToken,
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
 			},
-			ExpectedStatus:  401,
-			ExpectedContent: []string{`"status":401`},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"expires_at":"2028-01-01 00:00:00.000Z"`},
 		},
 	}
 
@@ -673,131 +940,74 @@ func TestCreateAPIKeyHandler_Unauthenticated(t *testing.T) {
 	}
 }
 
-func TestCreateAPIKeyHandler_MaxKeysPerUser(t *testing.T) {
+func TestCreateKey_MaxKeysPerUser(t *testing.T) {
 	t.Parallel()
 
-	scenario := tests.ApiScenario{
-		Name:   "exceed max keys per user — bad request",
+	cfg := DefaultConfig()
+	cfg.MaxKeysPerUser = 1
+
+	scenarios := []tests.ApiScenario{
+		{
+			Name:   "creating a key over the limit is rejected",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"one too many","user":"` + testUserId + `"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+			},
+			ExpectedStatus:     400,
+			ExpectedContent:    []string{"Maximum of 1 active API keys reached"},
+			NotExpectedContent: []string{`"key"`},
+		},
+		{
+			Name:   "a disabled key does not count towards the limit",
+			Method: http.MethodPost,
+			URL:    recordsURL,
+			Body:   strings.NewReader(`{"name":"after revoke","user":"` + testUserId + `"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				createTestKeyRecord(app, tb, cfg, testUserId, true, "")
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"key":"` + cfg.KeyPrefix},
+		},
+	}
+
+	for _, s := range scenarios {
+		s.Test(t)
+	}
+}
+
+func TestCreateKey_SuperuserMayAssignOwner(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenario tests.ApiScenario
+	scenario = tests.ApiScenario{
+		Name:   "superuser can create a key for another user",
 		Method: http.MethodPost,
-		URL:    "/api/api-key",
-		Body:   strings.NewReader(`{"name":"Third Key"}`),
+		URL:    recordsURL,
+		Body:   strings.NewReader(`{"name":"on behalf","user":"` + testUserId + `"}`),
 		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
+			"Content-Type": "application/json",
 		},
 		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			cfg.MaxKeysPerUser = 2
-			bootstrapPlugin(app, tb, cfg)
-
-			// Create two active keys to fill up the quota
-			createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-			createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
+			bootstrapHooks(app, tb, cfg)
+			scenario.Headers["Authorization"] = superuserToken(tb, app)
 		},
-		ExpectedStatus:  400,
-		ExpectedContent: []string{`"status":400`},
+		ExpectedStatus:  200,
+		ExpectedContent: []string{`"key":"` + cfg.KeyPrefix, `"user":"` + testUserId + `"`},
 	}
 
 	scenario.Test(t)
-}
-func TestCreateAPIKeyHandler_WithExpiry(t *testing.T) {
-	t.Parallel()
-
-	scenarios := []tests.ApiScenario{
-		{
-			Name:   "create api key with expiry date",
-			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{"name":"Expiring Key","expires_at":"2099-12-31 23:59:59.000Z"}`),
-			Headers: map[string]string{
-				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
-			},
-			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
-			},
-			ExpectedStatus: 201,
-			ExpectedContent: []string{
-				`"name":"Expiring Key"`,
-				`"expires_at":"2099-12-31`,
-			},
-		},
-	}
-
-	for _, s := range scenarios {
-		s.Test(t)
-	}
-}
-
-func TestCreateAPIKeyHandler_InvalidExpiry(t *testing.T) {
-	t.Parallel()
-
-	scenarios := []tests.ApiScenario{
-		{
-			Name:   "create api key with unparseable expiry — treated as no expiry (201)",
-			Method: http.MethodPost,
-			URL:    "/api/api-key",
-			Body:   strings.NewReader(`{"name":"Bad Expiry","expires_at":"not-a-date"}`),
-			Headers: map[string]string{
-				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
-			},
-			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
-			},
-			ExpectedStatus: 201,
-			ExpectedContent: []string{
-				`"name":"Bad Expiry"`,
-				`"expires_at":""`,
-			},
-		},
-	}
-
-	for _, s := range scenarios {
-		s.Test(t)
-	}
-}
-
-func TestCreateAPIKeyHandler_CustomPath(t *testing.T) {
-	t.Parallel()
-
-	scenarios := []tests.ApiScenario{
-		{
-			Name:   "create api key on custom path",
-			Method: http.MethodPost,
-			URL:    "/api/custom-keys",
-			Body:   strings.NewReader(`{"name":"Custom Path Key"}`),
-			Headers: map[string]string{
-				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
-			},
-			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				cfg.ApiPath = "/api/custom-keys"
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.POST(cfg.ApiPath, createAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
-			},
-			ExpectedStatus: 201,
-			ExpectedContent: []string{
-				`"name":"Custom Path Key"`,
-				`"key":"pbk_`,
-			},
-		},
-	}
-
-	for _, s := range scenarios {
-		s.Test(t)
-	}
 }
 
 // =============================================================================
@@ -864,368 +1074,523 @@ func TestValidateConfig(t *testing.T) {
 }
 
 // =============================================================================
-// Generic Record API Blocked Tests
+// Update Tests — built-in Record API (PATCH /api/collections/apiKeys/records/:id)
 // =============================================================================
 
-func TestGenericCreateBlocked(t *testing.T) {
+func TestUpdateKey_Rename(t *testing.T) {
 	t.Parallel()
 
-	scenarios := []tests.ApiScenario{
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
 		{
-			Name:   "generic create on apiKeys collection is blocked",
-			Method: http.MethodPost,
-			URL:    "/api/collections/apiKeys/records",
-			Body:   strings.NewReader(`{"name":"hacked","key_hash":"abc","key_prefix":"pbk_","user":"` + testUserId + `"}`),
-			Headers: map[string]string{
-				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
-			},
-			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-			},
-			ExpectedStatus:  403,
-			ExpectedContent: []string{`Only superusers`},
-		},
-	}
-
-	for _, s := range scenarios {
-		s.Test(t)
-	}
-}
-
-func TestGenericUpdateBlocked(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "generic update on apiKeys collection is blocked",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"user":"someoneelse"}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			// Create a key via the custom handler path (direct DB insert)
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			// Mutate URL after record is created
-			scenario.URL = "/api/collections/apiKeys/records/" + recordId
-		},
-		ExpectedStatus:  403,
-		ExpectedContent: []string{`Only superusers`},
-	}
-
-	scenario.Test(t)
-}
-
-// =============================================================================
-// Update API Key Handler Tests (PATCH /api/api-key/:id)
-// =============================================================================
-
-func TestUpdateAPIKeyHandler_Rename(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "rename api key via PATCH",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"name":"Renamed Key"}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  200,
-		ExpectedContent: []string{`"name":"Renamed Key"`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_DisableAndReenable(t *testing.T) {
-	t.Parallel()
-
-	// First disable
-	var scenario1 tests.ApiScenario
-	scenario1 = tests.ApiScenario{
-		Name:   "disable api key via PATCH",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"disabled":true}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario1.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  200,
-		ExpectedContent: []string{`"disabled":true`},
-	}
-
-	scenario1.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_SetExpiry(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "set expiry on api key via PATCH",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"expires_at":"2099-12-31 23:59:59.000Z"}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  200,
-		ExpectedContent: []string{`"expires_at":"2099-12-31`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_CannotChangeUser(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "cannot change user field via PATCH",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"user":"hacked_id"}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  400,
-		ExpectedContent: []string{`immutable`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_CannotChangeHash(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "cannot change key_hash field via PATCH",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"key_hash":"evil_hash"}`),
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-			"Content-Type":  "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  400,
-		ExpectedContent: []string{`immutable`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_Unauthenticated(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "update api key without auth ??unauthorized",
-		Method: http.MethodPatch,
-		URL:    "", // set in BeforeTestFunc
-		Body:   strings.NewReader(`{"name":"No Auth"}`),
-		Headers: map[string]string{
-			"Content-Type": "application/json",
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  401,
-		ExpectedContent: []string{`"status":401`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestUpdateAPIKeyHandler_NotFound(t *testing.T) {
-	t.Parallel()
-
-	scenarios := []tests.ApiScenario{
-		{
-			Name:   "update nonexistent key ??not found",
+			Name:   "rename a key",
 			Method: http.MethodPatch,
-			URL:    "/api/api-key/nonexistent123",
-			Body:   strings.NewReader(`{"name":"Ghost Key"}`),
+			URL:    "", // set in BeforeTestFunc
+			Body:   strings.NewReader(`{"name":"Renamed Key"}`),
 			Headers: map[string]string{
 				"Authorization": testUserToken,
-				"Content-Type":  "application/json",
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.PATCH(cfg.ApiPath+"/{id}", updateAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
 			},
-			ExpectedStatus:  404,
-			ExpectedContent: []string{`"status":404`},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"name":"Renamed Key"`},
 		},
 	}
 
-	for _, s := range scenarios {
-		s.Test(t)
+	for i := range scenarios {
+		scenarios[i].Test(t)
 	}
 }
 
-// =============================================================================
-// Delete API Key Handler Tests (DELETE /api/api-key/:id)
-// =============================================================================
-
-func TestDeleteAPIKeyHandler_Success(t *testing.T) {
+func TestUpdateKey_Disable(t *testing.T) {
 	t.Parallel()
 
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:   "delete own api key",
-		Method: http.MethodDelete,
-		URL:    "", // set in BeforeTestFunc
-		Headers: map[string]string{
-			"Authorization": testUserToken,
-		},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
+	cfg := DefaultConfig()
 
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  200,
-		ExpectedContent: []string{`"message":"API key deleted"`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestDeleteAPIKeyHandler_Unauthenticated(t *testing.T) {
-	t.Parallel()
-
-	var scenario tests.ApiScenario
-	scenario = tests.ApiScenario{
-		Name:    "delete api key without auth ??unauthorized",
-		Method:  http.MethodDelete,
-		URL:     "", // set in BeforeTestFunc
-		Headers: map[string]string{},
-		BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-			cfg := DefaultConfig()
-			bootstrapPlugin(app, tb, cfg)
-
-			_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
-
-			e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
-				Bind(apis.RequireAuth())
-
-			scenario.URL = cfg.ApiPath + "/" + recordId
-		},
-		ExpectedStatus:  401,
-		ExpectedContent: []string{`"status":401`},
-	}
-
-	scenario.Test(t)
-}
-
-func TestDeleteAPIKeyHandler_NotFound(t *testing.T) {
-	t.Parallel()
-
-	scenarios := []tests.ApiScenario{
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
 		{
-			Name:   "delete nonexistent key ??not found",
-			Method: http.MethodDelete,
-			URL:    "/api/api-key/nonexistent123",
+			Name:   "disable a key",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"disabled":true}`),
 			Headers: map[string]string{
 				"Authorization": testUserToken,
 			},
 			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
-				cfg := DefaultConfig()
-				bootstrapPlugin(app, tb, cfg)
-				e.Router.DELETE(cfg.ApiPath+"/{id}", deleteAPIKeyHandler(app, cfg)).
-					Bind(apis.RequireAuth())
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"disabled":true`},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+func TestUpdateKey_SetAndClearExpiry(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "set expiry",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"expires_at":"2028-06-01 00:00:00.000Z"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"expires_at":"2028-06-01 00:00:00.000Z"`},
+		},
+		{
+			Name:   "clear expiry",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"expires_at":""}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "2028-06-01 00:00:00.000Z")
+				scenarios[1].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:     200,
+			ExpectedContent:    []string{`"expires_at":""`},
+			NotExpectedContent: []string{`"expires_at":"2028-06-01`},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+func TestUpdateKey_ImmutableFields(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	for _, field := range []string{"user", "key_prefix", "id", "created", "updated", "key"} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			var scenarios []tests.ApiScenario
+			scenarios = []tests.ApiScenario{
+				{
+					Name:   "changing " + field + " is rejected",
+					Method: http.MethodPatch,
+					URL:    "",
+					Body:   strings.NewReader(`{"` + field + `":"tampered"}`),
+					Headers: map[string]string{
+						"Authorization": testUserToken,
+					},
+					BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+						bootstrapHooks(app, tb, cfg)
+						_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+						scenarios[0].URL = recordsURL + "/" + recordId
+					},
+					ExpectedStatus: 400,
+					ExpectedContent: []string{
+						fmt.Sprintf("\\\"%s\\\" is immutable", field),
+					},
+				},
+			}
+
+			for i := range scenarios {
+				scenarios[i].Test(t)
+			}
+		})
+	}
+}
+
+func TestUpdateKey_HashCannotBeSpoofed(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var hashBefore, hashAfter string
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "the hidden key_hash field cannot be overwritten",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"key_hash":"deadbeefdeadbeefdeadbeefdeadbeef","name":"still mine"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+
+				record, err := app.FindRecordById(cfg.CollectionName, recordId)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				hashBefore = record.GetString("key_hash")
+			},
+			// the raw body is checked, so an explicit attempt to set the hidden
+			// key_hash field is rejected outright instead of being ignored
+			ExpectedStatus:     400,
+			ExpectedContent:    []string{`is immutable`},
+			NotExpectedContent: []string{"deadbeef"},
+			AfterTestFunc: func(tb testing.TB, app *tests.TestApp, res *http.Response) {
+				records, err := app.FindAllRecords(cfg.CollectionName)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				hashAfter = records[0].GetString("key_hash")
+			},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+
+	if hashBefore == "" {
+		t.Fatal("expected the stored hash to be captured before the request")
+	}
+	if hashBefore != hashAfter {
+		t.Errorf("key_hash changed from %q to %q", hashBefore, hashAfter)
+	}
+}
+
+func TestUpdateKey_EmptyName(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "clearing the name fails validation",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"name":""}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  400,
+			ExpectedContent: []string{`"validation_required"`},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+func TestUpdateKey_AccessControl(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "another user cannot update the key",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"name":"hijacked"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				// owned by a different, real user
+				_, recordId := createTestKeyRecord(app, tb, cfg, createSecondUser(tb, app), false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+		{
+			Name:   "guest cannot update a key",
+			Method: http.MethodPatch,
+			URL:    "",
+			Body:   strings.NewReader(`{"name":"hijacked"}`),
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[1].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+		{
+			Name:   "unknown key id returns 404",
+			Method: http.MethodPatch,
+			URL:    recordsURL + "/nonexistentid123",
+			Body:   strings.NewReader(`{"name":"ghost"}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
 			},
 			ExpectedStatus:  404,
 			ExpectedContent: []string{`"status":404`},
 		},
 	}
 
-	for _, s := range scenarios {
-		s.Test(t)
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+// =============================================================================
+// Delete Tests — built-in Record API (DELETE /api/collections/apiKeys/records/:id)
+// =============================================================================
+
+func TestDeleteKey_Owner(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "owner can delete their key",
+			Method: http.MethodDelete,
+			URL:    "",
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			// no content expectations => the harness asserts an empty body
+			ExpectedStatus: 204,
+			AfterTestFunc: func(tb testing.TB, app *tests.TestApp, res *http.Response) {
+				records, err := app.FindAllRecords(cfg.CollectionName)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				if len(records) != 0 {
+					tb.Errorf("expected the record to be gone, got %d records", len(records))
+				}
+			},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+func TestDeleteKey_AccessControl(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "another user cannot delete the key",
+			Method: http.MethodDelete,
+			URL:    "",
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, createSecondUser(tb, app), false, "")
+				scenarios[0].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+		{
+			Name:   "guest cannot delete a key",
+			Method: http.MethodDelete,
+			URL:    "",
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+				_, recordId := createTestKeyRecord(app, tb, cfg, testUserId, false, "")
+				scenarios[1].URL = recordsURL + "/" + recordId
+			},
+			ExpectedStatus:  404,
+			ExpectedContent: []string{`"status":404`},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+// =============================================================================
+// Batch API — POST /api/batch
+// =============================================================================
+
+func TestBatchRequest_GoesThroughHooks(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+
+	var scenarios []tests.ApiScenario
+	scenarios = []tests.ApiScenario{
+		{
+			Name:   "a batched create still generates the key",
+			Method: http.MethodPost,
+			URL:    "/api/batch",
+			Body: strings.NewReader(`{"requests":[{"method":"POST",` +
+				`"url":"/api/collections/apiKeys/records",` +
+				`"body":{"name":"batched","user":"` + testUserId + `"}}]}`),
+			Headers: map[string]string{
+				"Authorization": testUserToken,
+			},
+			BeforeTestFunc: func(tb testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				bootstrapHooks(app, tb, cfg)
+
+				// The batch API is disabled by default.
+				settings := app.Settings()
+				settings.Batch.Enabled = true
+				if err := app.Save(settings); err != nil {
+					tb.Fatal(err)
+				}
+			},
+			ExpectedStatus:  200,
+			ExpectedContent: []string{`"key":"` + cfg.KeyPrefix, `"status":200`},
+			NotExpectedContent: []string{
+				`"key_hash"`,
+			},
+		},
+	}
+
+	for i := range scenarios {
+		scenarios[i].Test(t)
+	}
+}
+
+// =============================================================================
+// End-to-end — a key returned by create authenticates the next request
+// =============================================================================
+
+func TestEndToEnd_CreateThenAuthenticate(t *testing.T) {
+	t.Parallel()
+
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Cleanup()
+
+	cfg := DefaultConfig()
+	bootstrapHooks(app, t, cfg)
+
+	router, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serveEvent := new(core.ServeEvent)
+	serveEvent.App = app
+	serveEvent.Router = router
+
+	err = app.OnServe().Trigger(serveEvent, func(e *core.ServeEvent) error {
+		e.Router.BindFunc(apiKeyAuthMiddleware(app, cfg))
+		e.Router.GET("/test-whoami", func(re *core.RequestEvent) error {
+			if re.Auth == nil {
+				return re.JSON(http.StatusOK, map[string]string{"userId": ""})
+			}
+			return re.JSON(http.StatusOK, map[string]string{"userId": re.Auth.Id})
+		})
+		return e.Next()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux, err := router.BuildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. create a key through the built-in API
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		recordsURL,
+		strings.NewReader(`{"name":"e2e","user":"`+testUserId+`"}`),
+	)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Authorization", testUserToken)
+
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("expected create status 200, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+
+	created := struct {
+		Key string `json:"key"`
+	}{}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(created.Key, cfg.KeyPrefix) {
+		t.Fatalf("expected a %q prefixed key, got %q", cfg.KeyPrefix, created.Key)
+	}
+
+	// 2. use the returned key as the authentication header
+	whoamiReq := httptest.NewRequest(http.MethodGet, "/test-whoami", nil)
+	whoamiReq.Header.Set(cfg.HeaderName, created.Key)
+
+	whoamiRec := httptest.NewRecorder()
+	mux.ServeHTTP(whoamiRec, whoamiReq)
+
+	if whoamiRec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", whoamiRec.Code)
+	}
+	if !strings.Contains(whoamiRec.Body.String(), `"userId":"`+testUserId+`"`) {
+		t.Errorf("expected the created key to authenticate as %q, got %s", testUserId, whoamiRec.Body.String())
+	}
+
+	// 3. a disabled key must stop authenticating
+	records, err := app.FindAllRecords(cfg.CollectionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records[0].Set("disabled", true)
+	if err := app.Save(records[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	revokedRec := httptest.NewRecorder()
+	mux.ServeHTTP(revokedRec, whoamiReq)
+
+	if !strings.Contains(revokedRec.Body.String(), `"userId":""`) {
+		t.Errorf("expected a disabled key to stop authenticating, got %s", revokedRec.Body.String())
 	}
 }
