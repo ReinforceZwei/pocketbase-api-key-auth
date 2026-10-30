@@ -1,8 +1,8 @@
 package apikeyauth
 
 import (
-	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tools/types"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/tools/types"
 )
 
 // desiredCollection returns the canonical schema for the apiKeys collection.
