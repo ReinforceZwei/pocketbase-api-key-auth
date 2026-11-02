@@ -19,7 +19,8 @@ hashing, ownership, immutable fields) to those endpoints with PocketBase's
 go get github.com/ReinforceZwei/pocketbase-api-key-auth
 ```
 
-Requires Go 1.25+ and PocketBase v0.39+.
+Requires Go 1.27+ and PocketBase v0.41+ (module path `ganigeorgiev.com/pocketbase/pocketbase` —
+PocketBase's Go module moved off GitHub in v0.40).
 
 ---
 
@@ -31,7 +32,7 @@ package main
 import (
     "log"
 
-    "github.com/pocketbase/pocketbase"
+    "ganigeorgiev.com/pocketbase/pocketbase"
     "github.com/ReinforceZwei/pocketbase-api-key-auth"
 )
 
@@ -282,8 +283,8 @@ See [`api-key-plugin-design.md`](api-key-plugin-design.md) for the full design d
 
 ### Prerequisites
 
-- Go 1.25+
-- PocketBase v0.39+
+- Go 1.27+
+- PocketBase v0.41+ (`ganigeorgiev.com/pocketbase/pocketbase`)
 
 ### Setup
 
@@ -351,6 +352,11 @@ This is a Go library — follow standard module versioning with git tags.
 
 | Plugin version | PocketBase version | Go version |
 |---|---|---|
-| v0.x | v0.39+ | 1.25+ |
+| v0.1 – v0.3 | v0.39+ (`github.com/pocketbase`) | 1.25+ |
+| unreleased (`main`) | v0.41+ (`ganigeorgiev.com`) | 1.27+ |
+
+PocketBase moved its Go module from GitHub to `ganigeorgiev.com/pocketbase/pocketbase` in v0.40;
+the GitHub repository is archived at v0.40.6. Older plugin tags therefore pin the archived import
+path and cannot be consumed together with PocketBase v0.41+.
 
 The plugin uses PocketBase's own `tools/security` and `tools/types` packages with no external crypto dependencies, so compatibility is tied to the PocketBase minor version.

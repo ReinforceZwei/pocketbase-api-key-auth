@@ -123,7 +123,7 @@ package main
 
 import (
     "log"
-    "github.com/pocketbase/pocketbase"
+    "ganigeorgiev.com/pocketbase/pocketbase"
     "github.com/ReinforceZwei/pocketbase-api-key-auth/apikeyauth"
 )
 
@@ -146,7 +146,7 @@ func main() {
 
 ## 2. Key Generation & Hashing
 
-Uses PocketBase's own [`security`](https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/security) package — no external crypto dependencies needed.
+Uses PocketBase's own [`security`](https://pkg.go.dev/ganigeorgiev.com/pocketbase/pocketbase/tools/security) package — no external crypto dependencies needed.
 
 ### Key Format
 
@@ -175,7 +175,7 @@ import (
     "fmt"
     "strings"
 
-    "github.com/pocketbase/pocketbase/tools/security"
+    "ganigeorgiev.com/pocketbase/pocketbase/tools/security"
 )
 
 // generateAPIKey creates a new API key with the given prefix and random character length.

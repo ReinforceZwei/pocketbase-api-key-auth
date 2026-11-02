@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 )
 
 // Config holds all customizable settings for the plugin.
