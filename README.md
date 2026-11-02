@@ -353,7 +353,7 @@ This is a Go library — follow standard module versioning with git tags.
 | Plugin version | PocketBase version | Go version |
 |---|---|---|
 | v0.1 – v0.3 | v0.39+ (`github.com/pocketbase`) | 1.25+ |
-| unreleased (`main`) | v0.41+ (`ganigeorgiev.com`) | 1.27+ |
+| v0.4 | v0.41+ (`ganigeorgiev.com`) | 1.27+ |
 
 PocketBase moved its Go module from GitHub to `ganigeorgiev.com/pocketbase/pocketbase` in v0.40;
 the GitHub repository is archived at v0.40.6. Older plugin tags therefore pin the archived import
